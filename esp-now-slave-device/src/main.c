@@ -17,10 +17,8 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 #include "../../misc-headers/esp-now-message-struct.h"
 
 
-#define CHANNEL 6
+#define TEST_CHANNEL 6
 #define SENSOR_PIN 25
-#define RED_LED_PIN 26
-#define GREEN_LED_PIN 27
 #define LOW 0
 #define HIGH 1
 #define RELEASE_BUILD_SLEEP_TIME 43200000000 /* 43,200,000,000 == 12 hours. */
@@ -39,8 +37,6 @@ void onReceived(const esp_now_recv_info_t *peer_info, const uint8_t *data_receiv
 
 
 /* Global variables. */
-int message_count = 0;
-uint8_t master[ESP_NOW_ETH_ALEN] = {0x88, 0x13, 0xbf, 0x0b, 0xe1, 0x50};
 esp_netif_t *netif_wifi_sta;
 send_counter_t send_counter_state; /* Callback function registered for sending should be the only one to update this. */
 
@@ -67,11 +63,9 @@ bool initWiFi() {
     ESP_ERROR_CHECK(esp_wifi_init(&config)); // Initialize wifi driver used by the interface.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start()); // Start wifi in set mode.
-    ESP_ERROR_CHECK(esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(TEST_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_disconnect()); // Disconnect to ensure d/'evice does not auto-connect to AP or other peer.
    
-    /* Set send counter state. */
-    send_counter_state = INITIAL_SEND;
     printf("initWiFi() call exit...\n");
     
     return true;
@@ -93,31 +87,18 @@ bool initESPNOW() {
 void pinConfig() { 
     printf("pinConfig() call entry...\n");
 
-    gpio_config_t cfg;
-    cfg.pin_bit_mask = (1ULL << GPIO_NUM_26 | 1ULL << GPIO_NUM_27); /* Pins used by RED_LED_PIN and GREEN_LED_PIN. */
-    cfg.mode = GPIO_MODE_OUTPUT;
-    cfg.intr_type = GPIO_INTR_DISABLE;
-
-    gpio_config(&cfg);
-
-    printf("Resetting LED to OFF...\n");
-    /* Reset state of LEDs. */
-    gpio_set_level(RED_LED_PIN, LOW);
-    gpio_set_level(GREEN_LED_PIN, LOW); 
-
     /* For beam sensor. */
     printf("Setting Sensor direction...\n");
     gpio_set_direction(SENSOR_PIN, GPIO_MODE_INPUT);
+     gpio_set_intr_type(SENSOR_PIN, GPIO_INTR_DISABLE);
     gpio_set_pull_mode(SENSOR_PIN, GPIO_PULLUP_ONLY);
     gpio_pullup_en(SENSOR_PIN);
 
     printf("pinConfig() call exit...\n");
-
 } // End of pinConfig().
 
 void sleepConfig() {
     printf("sleepConfig() call entry...\n");
-
 
     /* Turn ON then OFF all Power Domains (PDs). Based on my current knowledge of 
        this is just for avoiding assertion when ref >= 0 is false for any of the PDs.
@@ -143,9 +124,7 @@ void sleepConfig() {
 } // End of sleepConfig().
 
 
-
-
-/* Send callback function. */
+/* Send callback function definition start. */
 
 void onSent(const esp_now_send_info_t *peer_info, esp_now_send_status_t status) {
     printf("onSent() call entry...\n");
@@ -180,7 +159,7 @@ void onSent(const esp_now_send_info_t *peer_info, esp_now_send_status_t status) 
     }
     
     printf("onSent() call exit...\n");
-}
+}/* End of onSent(). */
 
 void onReceived(const esp_now_recv_info_t *peer_info, const uint8_t *data_received, int data_len) {
     printf("onReceived() call entry...\n");
@@ -193,13 +172,10 @@ void onReceived(const esp_now_recv_info_t *peer_info, const uint8_t *data_receiv
     printf("Message: \n\t%s\n\n", data_received);
     printf("onReceived() call exit...\n");
 
-}
+} /* End of onReceived(). */
+/* Send callback function definition end. */
 
-/* MISC Functions. */
-
-
-
-void setup() {
+void setupComponents(const uint8_t *master_mac_addr, const uint8_t wifi_channel) {
     printf("setup() call entry...\n");
     
     // Init wifi and esp_now.
@@ -208,79 +184,77 @@ void setup() {
     }
 
     // Fill peer info.
-    esp_now_peer_info_t peer = {
-        .channel = 6,
+    esp_now_peer_info_t master_info = {
+        .channel = wifi_channel,
         .ifidx = WIFI_IF_STA
     };
 
     // Copy address of peer to the struct.
-    memcpy(peer.peer_addr, master, ESP_NOW_ETH_ALEN); 
+    memcpy(master_info.peer_addr, master_mac_addr, ESP_NOW_ETH_ALEN); 
 
     // Add peer to list of devices connected to this device.
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    ESP_ERROR_CHECK(esp_now_add_peer(&master_info));
 
-    /* For debug: Construct first message. */
-    char data[50];
-    sprintf(data, "Message #%d: Hello from slave.", ++message_count);
+    /* Set send counter state. */
+    send_counter_state = INITIAL_SEND;
 
-    printf("Sending initial message to greet master...\n");
+} // End of setupComponents().
 
-    /* Note: Non-blocking. Don't expect call back to print immediately. */
-    esp_now_send(master, (const uint8_t*) data, sizeof(data));
-
-    // //printf("Dumping all GPIO configurations of Slave device...\n");
-    // gpio_dump_io_configuration(stdout, SOC_GPIO_VALID_GPIO_MASK);
-
-    /* Configure pin to be used. */
-    printf("Calling pinConfig().\n");
-    pinConfig();
-
-    printf("setup() call exit...\n");
-
-}
-
-
-
+/*
+    Program will first read the pin. If the pin reads HIGH, it will not do anything and will go back to sleep.
+    Otherwise, the program will set up appropriate components of ESP32 to send the data back to master device.
+    This way, the program can avoid unnecessary component setup when pin is HIGH, since it will not send anything.
+*/
 
 void app_main() {
 
-    printf("\n\nCalling setup()...\n");
-    setup(); // Set up components to be used.
+    int sensor_read_level = 0;
 
-    int sensor_previous_state = 0;
-    int sensor_current_state = 0;
+    /* Configure pin to be used. */
+    printf("\nCalling pinConfig().\n");
+    pinConfig();
 
+    printf("\nReading sensor level...\n");
+    sensor_read_level = gpio_get_level(SENSOR_PIN); /* Read sensor state. */
+    printf("\nSensor read level: %s\n", sensor_read_level == HIGH ? "HIGH" : "LOW");
 
-    printf("Reading sensor level...\n");
-    sensor_current_state = gpio_get_level(SENSOR_PIN); /* Read sensor state. */
-    printf("Sensor value: %d\n", sensor_current_state);
+    if(sensor_read_level == LOW) {
+        /* Hard-coded for test. But in release, this must still be 
+           known ahead of time if broadcast is not used to acquire it. 
+        */
+        const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN] = {0x88, 0x13, 0xbf, 0x0b, 0xe1, 0x50};
 
-    if(sensor_current_state != sensor_previous_state) {
-        if(sensor_current_state) { /* HIGH. */
-            gpio_set_level(GREEN_LED_PIN, HIGH);
-            gpio_set_level(RED_LED_PIN, LOW);
-        }
-        else {
-            gpio_set_level(GREEN_LED_PIN, LOW);
-            gpio_set_level(RED_LED_PIN, HIGH);
-        }
-
-        // This may not be necessary if not printing to serial for debug.
-        char state[50];
-
-        // This can be included in the message instead.
-        sprintf(state, sensor_current_state ? "Beam unbroken. No mail in the mailbox" : "Beam broken. There is mail in the mailbox");
-        printf(state);
-        printf("\n");
+        printf("\nCalling setupESPNOW()...\n");
+        /* Set up components to be used for ESP-NOW data transmission. */
+        setupComponents(master_mac_addr, TEST_CHANNEL); 
 
         esp_message msg;
-            
-        msg.sensor_status_flag = sensor_current_state; // The first byte of the message must alway contain the sensor state.
-        snprintf(msg.message, sizeof(msg.message), "Message #%d: %s" , ++message_count, state);
-        printf("Sending subsequent message...\n");
-        esp_now_send(master, (uint8_t *)&msg, sizeof(msg));
-    
-        // Save state.
-        sensor_previous_state = sensor_current_state;
+
+        /* Hard-coded since initial message will not contain actual sensor read level. */
+        msg.sensor_read_level = HIGH;
+
+        sprintf(msg.message, "Greetings from Slave device!");
+        printf("Sending initial message to greet Master...\n");
+
+        /* Sending initial message to Master device. */
+        esp_now_send(master_mac_addr, (const uint8_t*)&msg, sizeof(msg)); /* Non-blocking. */
+
+        /* Description for LOW level sensor read. */
+        char sensor_read_level_description[50];
+        sprintf(sensor_read_level_description, "Beam broken. There is mail in the mailbox.");
+
+        // This may not be necessary if not printing to serial for debug.
+        printf(sensor_read_level_description);
+        printf("\n");
+
+        msg.sensor_read_level = sensor_read_level; // The first byte of the message must alway contain the sensor state.
+        snprintf(msg.message, sizeof(msg.message), sensor_read_level_description);
+        printf("\nSending subsequent message...\n");
+        esp_now_send(master_mac_addr, (const uint8_t *)&msg, sizeof(msg));
     }
-}
+    else {
+        sleepConfig();
+        ESP_ERROR_CHECK(esp_deep_sleep_try_to_start()); // Do not send until
+    }
+
+} // End of app_main().
