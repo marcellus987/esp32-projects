@@ -18,11 +18,15 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 
 
 #define TEST_CHANNEL 6
-#define SENSOR_PIN 25
 #define LOW 0
 #define HIGH 1
 #define RELEASE_BUILD_SLEEP_TIME 43200000000 /* 43,200,000,000 == 12 hours. */
 #define TEST_BUILD_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+
+/* RTC capable pins. */
+#define IR_SENSOR_PIN 25
+#define IR_EMITTER_PIN 26
+#define PIR_POWER_PIN 27
 
 typedef enum send_counter {
     INITIAL_SEND, 
@@ -89,10 +93,10 @@ void pinConfig() {
 
     /* For beam sensor. */
     printf("Setting Sensor direction...\n");
-    gpio_set_direction(SENSOR_PIN, GPIO_MODE_INPUT);
-     gpio_set_intr_type(SENSOR_PIN, GPIO_INTR_DISABLE);
-    gpio_set_pull_mode(SENSOR_PIN, GPIO_PULLUP_ONLY);
-    gpio_pullup_en(SENSOR_PIN);
+    gpio_set_direction(IR_SENSOR_PIN, GPIO_MODE_INPUT);
+     gpio_set_intr_type(IR_SENSOR_PIN, GPIO_INTR_DISABLE);
+    gpio_set_pull_mode(IR_SENSOR_PIN, GPIO_PULLUP_ONLY);
+    gpio_pullup_en(IR_SENSOR_PIN);
 
     printf("pinConfig() call exit...\n");
 } // End of pinConfig().
@@ -215,7 +219,7 @@ void app_main() {
     pinConfig();
 
     printf("\nReading sensor level...\n");
-    sensor_read_level = gpio_get_level(SENSOR_PIN); /* Read sensor state. */
+    sensor_read_level = gpio_get_level(IR_SENSOR_PIN); /* Read sensor state. */
     printf("\nSensor read level: %s\n", sensor_read_level == HIGH ? "HIGH" : "LOW");
 
     if(sensor_read_level == LOW) {
