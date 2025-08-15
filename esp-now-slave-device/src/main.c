@@ -319,6 +319,7 @@ void app_main() {
                 /* For debug. */
                 printf("Deactivating IR pins...\n");
                 turnOffPin(1ULL << IR_EMITTER_TRANSISTOR_PIN | 1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN);
+                
             }
         }
     }
