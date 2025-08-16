@@ -12,16 +12,25 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 #include <esp_mac.h>
 #include <string.h>
 #include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <esp_sleep.h>
 
 #include "../../misc-headers/esp-now-message-struct.h"
 
+
+#define MAGIC_NUMBER 0xDEADBEEF
 
 #define TEST_CHANNEL 6
 #define LOW 0
 #define HIGH 1
 #define RELEASE_BUILD_SLEEP_TIME 43200000000 /* 43,200,000,000 == 12 hours. */
 #define TEST_BUILD_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+
+/* Sleeping times. */
+#define TEST_INITIAL_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+#define TEST_PIR_START_UP_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+#define TEST_FIRST_MOTION_DETECTED_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+#define TEST_IR_BEAM_PULSE_INTERVAL 5000000 /* 5000000 == 5 seconds. */
 
 /* RTC capable pins. */
 /* IR emitter and sensor pins. */
@@ -33,12 +42,43 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 #define PIR_TRANSISTOR_PIN 32
 #define PIR_READ_PIN 33
 
+#define MAX_PULSE_COUNT 10
+
+
+typedef enum device_state {
+    INITIAL_READ, /* Wakeup source: Timer. */
+    PIR_READY, /* Sleep until first motion detected. Wakeup source: PIR_READ_PIN. */
+    RETRIEVAL_PHASE, /* Sleep to give user time to empty mailbox. Wakeup source: Timer. */
+    IR_BEAM_PULSE /* For beam pulse intervals. Wakeup source: Timer.*/
+} device_state_t;
+
+
+typedef enum sleep_mode {
+    SLEEP_INITIAL_TIME,
+    SLEEP_PIR_START_UP_TIME,
+    SLEEP_AWAIT_MOTION,
+    SLEEP_RETRIEVAL_TIME,
+    SLEEP_IR_BEAM_PULSE_TIME
+} sleep_mode_t;
+
+typedef struct saved_state {
+    device_state_t state;
+    uint32_t magicNumber;
+} saved_state_t;
+
+
 /* Callback function prototype. */
 void onSent(const esp_now_send_info_t *peer_info, esp_now_send_status_t status);
 void onReceived(const esp_now_recv_info_t *peer_info, const uint8_t *data_received, int data_len);
 
 /* Global variables. */
 esp_netif_t *netif_wifi_sta;
+RTC_NOINIT_ATTR saved_state_t next_phase; /* Used for checkpoints due to RTC_NOINIT_ATTR. */
+RTC_SLOW_ATTR uint8_t pulse_counter = 0;
+
+//  saved_state_t next_phase; /* Used for checkpoints due to RTC_NOINIT_ATTR. */
+//  uint8_t pulse_counter = 0;
+
 
 /********** ESP-NOW Component setup start. **********/
 bool initWiFi() {
@@ -107,8 +147,10 @@ void setupComponents(const uint8_t *master_mac_addr, const uint8_t wifi_channel)
 
 /********** Pin configurations start. **********/
 void irPinConfig() { 
+    printf("irPinConfig() call entry...\n");
+    
    const gpio_config_t cfg = {
-    .pin_bit_mask = (1ULL << IR_SENSOR_READ_PIN | 1ULL | IR_SENSOR_TRANSISTOR_PIN | 1ULL << IR_EMITTER_TRANSISTOR_PIN),
+    .pin_bit_mask = (1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN | 1ULL << IR_EMITTER_TRANSISTOR_PIN),
     .mode = GPIO_MODE_OUTPUT, /* Make sure to change IR_SENSOR_READ_PIN to input. */
     .intr_type = GPIO_INTR_DISABLE
    };
@@ -116,28 +158,52 @@ void irPinConfig() {
 
    gpio_set_direction(IR_SENSOR_READ_PIN, GPIO_MODE_INPUT); 
    gpio_pullup_en(IR_SENSOR_READ_PIN);
-} // End of pinConfig().
+    printf("irPinConfig() call exit...\n");
+} /* End of pinConfig(). */
 
-void pirPinConfig() {
-   gpio_set_direction(PIR_READ_PIN, GPIO_MODE_INPUT);
-   gpio_set_direction(PIR_TRANSISTOR_PIN, GPIO_MODE_OUTPUT);
-   gpio_set_intr_type(PIR_READ_PIN, GPIO_INTR_DISABLE); /* Disabled for now. Need more knowledge about this.*/
-}
+void rtc_PirTransistorPinConfig() {
+    printf("rtc_PirTransistorPinConfig() call entry...\n");
+    rtc_gpio_init(PIR_TRANSISTOR_PIN);
+    rtc_gpio_set_direction(PIR_TRANSISTOR_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level(PIR_TRANSISTOR_PIN, HIGH);
+    rtc_gpio_hold_en(PIR_TRANSISTOR_PIN);
+    printf("rtc_PirTransistorPinConfig() call exit...\n");
+
+} /* End of rtc_PirTransistorPinConfig(). */
+
+void rtc_PirReadPinConfig() {
+    printf("rtc_PirReadPinConfig() call entry...\n");
+    rtc_gpio_init(PIR_READ_PIN);
+    rtc_gpio_set_direction(PIR_READ_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+    printf("rtc_PirReadPinConfig() call exit...\n");
+} /* End of rtc_PirReadPinConfig(). */
+
+void rtc_PirTurnOff() {
+    printf("rtc_PirTurnOff() call entry...\n");
+    rtc_gpio_hold_dis(PIR_TRANSISTOR_PIN);
+    rtc_gpio_set_direction(RTC_GPIO_MODE_DISABLED, PIR_TRANSISTOR_PIN);
+    rtc_gpio_set_direction(RTC_GPIO_MODE_DISABLED, PIR_READ_PIN);
+    rtc_gpio_deinit(PIR_TRANSISTOR_PIN);
+    rtc_gpio_deinit(PIR_READ_PIN);
+    printf("rtc_PirTurnOff() call exit...\n");
+} /* End of rtc_PirTurnOff(). */
 
 /**/
-void turnOffPin(uint64_t mask) {
+void turnOffIrPin(uint64_t mask) {
+    printf("turnOffIrPin() call entry...\n");
     const gpio_config_t cfg = {
         .pin_bit_mask = mask,
         .mode = GPIO_MODE_DISABLE
     };
 
     gpio_config(&cfg);
-}
+    printf("turnOffIrPin() call exit...\n");
+}/* End of turnOffIrPin(). */
 /********** Pin configurations End. **********/
 
 
 /********** Sleep configurations start. **********/
-void configDeepSleep() {
+void configDeepSleep(sleep_mode_t mode) {
     printf("configDeepSleep() call entry...\n");
 
     /* Turn ON then OFF all Power Domains (PDs). Based on my current knowledge of 
@@ -145,30 +211,24 @@ void configDeepSleep() {
        Turning is OFF sets ref == 0 which makes it eligible for ESP_PD_OPTION_OFF since
        ref >= 0 is true.
     */
-    printf("\n\nTurning PDs to neutral state for sleep...\n\n"); 
-    for(int i = 0; i < ESP_PD_DOMAIN_MAX; ++i) {
-        esp_sleep_pd_config(i, ESP_PD_OPTION_ON);
+    if(mode == SLEEP_INITIAL_TIME) {
+        esp_sleep_enable_timer_wakeup(TEST_INITIAL_SLEEP_TIME);
     }
-
-    printf("\n\nTurning PDs OFF for sleep...\n\n");
-
-    for(int i = 0; i < ESP_PD_DOMAIN_MAX; ++i) {
-        esp_sleep_pd_config(i, ESP_PD_OPTION_OFF);
+    else if(mode == SLEEP_PIR_START_UP_TIME) {
+        esp_sleep_enable_timer_wakeup(TEST_PIR_START_UP_SLEEP_TIME);
     }
-
-    // Enable RTC timer as wakeup source.
-    esp_sleep_enable_timer_wakeup(TEST_BUILD_SLEEP_TIME);
-
+    else if(mode == SLEEP_AWAIT_MOTION) {
+        esp_sleep_enable_ext0_wakeup(PIR_READ_PIN, HIGH); /* This one is signal driven. The rest are timer-based wakeup source.*/
+    }
+    else if(mode == SLEEP_RETRIEVAL_TIME) {
+        esp_sleep_enable_timer_wakeup(TEST_FIRST_MOTION_DETECTED_SLEEP_TIME);
+    }
+    else { /* mode == SLEEP_IR_BEAM_PULSE_TIME. */
+        esp_sleep_enable_timer_wakeup(TEST_IR_BEAM_PULSE_INTERVAL);
+    }
     printf("configDeepSleep() call exit...\n");
 
-} // End of sleepConfig().
-
-void configLightSleep() {
-    printf("configLightSleep() call entry...\n");
-
-
-    printf("configLightSleep() call exit...\n");
-} /* End of configLightSleep(). */
+} /* End of configDeepSleep(). */
 /********** Sleep configurations end. **********/
 
 
@@ -250,6 +310,29 @@ esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
 /********** ESP_NOW_SEND wrapper functions end. **********/
 
 
+
+/********** readIrPin() wrapper functions start. **********/
+uint8_t readIrPin() {
+    uint8_t sensor_read_level;
+
+    /* Configure IR pins to be used. */
+    printf("\nCalling irPinConfig().\n");
+    irPinConfig();
+
+    printf("\nReading sensor level...\n");
+    sensor_read_level = gpio_get_level(IR_SENSOR_READ_PIN); /* Read sensor state. */
+        
+    /* For debug. */
+    printf("Deactivating IR pins...\n");
+    turnOffIrPin(1ULL << IR_EMITTER_TRANSISTOR_PIN | 1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN);
+
+    return sensor_read_level;
+}
+/********** readIrPin() wrapper functions end. **********/
+
+
+
+
 /********** APP_MAIN start. **********/
 
 /*
@@ -259,82 +342,151 @@ esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
 */
 
 void app_main() {
-    /* Device will always strive to sleep deep to conserve energy. */
-    bool toSleepDeep = true; 
-    uint8_t sensor_read_level = 0;
+    printf("app_main() start...\n");
+    device_state_t current_state;
+    sleep_mode_t next_sleep_mode = SLEEP_INITIAL_TIME;
 
-    /* Configure IR pins to be used. */
-    printf("\nCalling irPinConfig().\n");
-    irPinConfig();
-
-    printf("\nReading sensor level...\n");
-    sensor_read_level = gpio_get_level(IR_SENSOR_READ_PIN); /* Read sensor state. */
-    printf("\nSensor read level: %s\n", sensor_read_level == HIGH ? "HIGH" : "LOW");
-
-    /* If mail in mailbox, setup necessary components for data tranmission to update Master. */
-    if(sensor_read_level == LOW) {
-        /* Hard-coded for test. But in release, this must still be 
-           known ahead of time if broadcast is not used to acquire it. 
-        */
-        const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN] = {0x88, 0x13, 0xbf, 0x0b, 0xe1, 0x50};
-        
-        printf("\nCalling setupESPNOW()...\n");
-        /* Set up components to be used for ESP-NOW data transmission. */
-        setupComponents(master_mac_addr, TEST_CHANNEL); 
-
-        /* Message structure. */
-        esp_message msg;
-
-        /* ----- Initial message to master. This can be removed in necessary. ----- */
-        msg.flag = NORMAL_MESSAGE;
-        msg.sensor_read_level = 0; /* Hard-coded since initial message will not contain actual sensor read level. */
-        sprintf(msg.message, "Greetings from Slave device!");
-        printf("Sending initial message to greet Master...\n");
-
-        /* Try to send inital message to check if there's any problem. */
-        if(try_send(master_mac_addr, msg) == ESP_OK) {
-            /* ----- Sensor Read Message ----- */
-
-            /* Description for LOW level sensor read. */
-            char sensor_read_level_description[50];
-            sprintf(sensor_read_level_description, "Beam broken. There is mail in the mailbox.");
-
-            /* This may not be necessary if not printing to serial for debug. */
-            printf(sensor_read_level_description);
-            printf("\n");
-
-            msg.flag = SENSOR_READ;
-            msg.sensor_read_level = sensor_read_level;
-            snprintf(msg.message, sizeof(msg.message), sensor_read_level_description);
-            printf("\nSending subsequent message...\n");
+    printf("Checking magic number to verify next state...\n");
+    if(next_phase.magicNumber != MAGIC_NUMBER) {
+        printf("Invalid Magic Number!\n");
+        next_phase.state = INITIAL_READ;
+        next_phase.magicNumber = MAGIC_NUMBER;
+    }
     
-            if(try_send(master_mac_addr, msg) == ESP_OK) {
-                toSleepDeep = false; /* Device will be on light-sleep until mailbox is emptied. */
+    current_state = next_phase.state;
 
-                /* Activate PIR sensor. */
-                /* For debug. */
-                printf("Activating PIR sensor pins...\n");
-                pirPinConfig();
+    printf("Entering switch(current_state) statement...\n");
+ 
+    /* next_phase is stored in RTC SLOW MEMORY. */
+    switch(current_state) {
+        case INITIAL_READ: {
+            printf("Case INITIAL_READ");
+            uint8_t sensor_read_level = readIrPin();
 
-                /* For debug. */
-                printf("Deactivating IR pins...\n");
-                turnOffPin(1ULL << IR_EMITTER_TRANSISTOR_PIN | 1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN);
-                
+            printf("\nSensor read level: %s\n", sensor_read_level == HIGH ? "HIGH" : "LOW");
+
+            /* If mail in mailbox, setup necessary components for data tranmission to update Master. */
+            if(sensor_read_level == LOW) {
+                /* Hard-coded for test. But in release, this must still be 
+                known ahead of time if broadcast is not used to acquire it. 
+                */
+                const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN] = {0x88, 0x13, 0xbf, 0x0b, 0xe1, 0x50};
+            
+                printf("\nCalling setupESPNOW()...\n");
+                /* Set up components to be used for ESP-NOW data transmission. */
+                setupComponents(master_mac_addr, TEST_CHANNEL); 
+
+                /* Message structure. */
+                esp_message msg;
+
+                /* ----- Initial message to master. This can be removed in necessary. ----- */
+                msg.flag = NORMAL_MESSAGE;
+                msg.sensor_read_level = 0; /* Hard-coded since initial message will not contain actual sensor read level. */
+                sprintf(msg.message, "Greetings from Slave device!");
+                printf("Sending initial message to greet Master...\n");
+
+                /* Try to send inital message to check if there's any problem. */
+                if(try_send(master_mac_addr, msg) == ESP_OK) {
+                    /* ----- Sensor Read Message ----- */
+
+                    /* Description for LOW level sensor read. */
+                    char sensor_read_level_description[50];
+                    sprintf(sensor_read_level_description, "Beam broken. There is mail in the mailbox.");
+
+                    /* This may not be necessary if not printing to serial for debug. */
+                    printf(sensor_read_level_description);
+                    printf("\n");
+
+                    msg.flag = SENSOR_READ;
+                    msg.sensor_read_level = sensor_read_level;
+                    snprintf(msg.message, sizeof(msg.message), sensor_read_level_description);
+                    printf("\nSending subsequent message...\n");
+            
+                    if(try_send(master_mac_addr, msg) == ESP_OK) {
+                        /* Activate PIR sensor. */
+                        /* For debug. */
+                        printf("Activating rtc PIR transistor pins...\n");
+                        rtc_PirTransistorPinConfig();
+                        next_sleep_mode = SLEEP_PIR_START_UP_TIME;
+                        next_phase.state = PIR_READY;
+                        printf("PIR Sensor ON. Going to deep-sleep to allow it to calibrate...\n");
+                    } /* if for sensor read message. */
+                } /* if for inital message. */
             }
-        }
-    }
+            break;
+        }  /* case FROM_INITIAL_READ: */
 
-    if(toSleepDeep) {
-        configDeepSleep();
-        ESP_ERROR_CHECK(esp_deep_sleep_try_to_start()); // Do not send until
-    }
-    else {
-        // light sleep
-    }
-    
+        case PIR_READY: { /* After PIR startup. */
+            printf("Activating rtc PIR read pins...\n");
+            rtc_PirReadPinConfig();
+            next_sleep_mode = SLEEP_AWAIT_MOTION;
+            printf("Entering deep-sleep to await motion trigger...\n");
+            next_phase.state = RETRIEVAL_PHASE;
+            break;
+        } /* case PIR_START_UP: */
+        case RETRIEVAL_PHASE: {
+            printf("First motion detected. Entering deep-sleep to allow user to empty mailbox...\n");
+            rtc_PirTurnOff();
+            next_sleep_mode = SLEEP_RETRIEVAL_TIME;
+            next_phase.state = IR_BEAM_PULSE;
+            break;
+        } /* case AWAITING_FOR_MOTION: */
+        case IR_BEAM_PULSE: {            
+            next_sleep_mode = SLEEP_INITIAL_TIME; /* Assuming it's Done. Reset state.*/
 
+            if(pulse_counter < MAX_PULSE_COUNT) {
+                uint8_t sensor_read_level = readIrPin();
+                if(sensor_read_level == HIGH) {
+                    /* Hard-coded for test. But in release, this must still be 
+                    known ahead of time if broadcast is not used to acquire it. 
+                    */
+                    const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN] = {0x88, 0x13, 0xbf, 0x0b, 0xe1, 0x50};
+                
+                    printf("\nCalling setupESPNOW()...\n");
+                    /* Set up components to be used for ESP-NOW data transmission. */
+                    setupComponents(master_mac_addr, TEST_CHANNEL); 
+
+                    /* Message structure. */
+                    esp_message msg;
+
+                    /* Description for HIGH level sensor read. */
+                    char sensor_read_level_description[50];
+                    sprintf(sensor_read_level_description, "Beam unbroken. Mailbox now empty.");
+
+                    /* This may not be necessary if not printing to serial for debug. */
+                    printf(sensor_read_level_description);
+                    printf("\n");
+
+                    msg.flag = SENSOR_READ;
+                    msg.sensor_read_level = sensor_read_level;
+                    snprintf(msg.message, sizeof(msg.message), sensor_read_level_description);
+                    printf("\nSending subsequent message...\n");
+                    
+                    try_send(master_mac_addr, msg);
+                    next_phase.state = INITIAL_READ;
+                } /* for if(sensor_read_level == HIGH). */
+                else {
+                    next_sleep_mode = SLEEP_IR_BEAM_PULSE_TIME;
+                }
+            } /* for if(pulse_counter < MAX_PULSE_COUNT).*/
+            break;
+        } /* case IR_BEAM_PULSE: */
+    } /* switch(phase). */
+
+    configDeepSleep(next_sleep_mode);
+    ESP_ERROR_CHECK(esp_deep_sleep_try_to_start()); // Do not send until
 } // End of app_main().
+
 
 /********** APP_MAIN end. **********/
 
 
+/*
+
+deepsleep(INITIAL): 12hr.
+deepsleep(PIR_START_UP): 1min.
+deepsleep(WAIT_FOR_MOTION): Trigger.
+deepsleep(FIRST_MOTION): 1min.
+deepsleep(PULSE): 30 sec.
+
+*/
