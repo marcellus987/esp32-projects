@@ -337,12 +337,12 @@ esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
         printf("Retry #%d...\n", i);
         err = esp_now_send(master_mac_addr, (const uint8_t *)&msg, message_size);
 
-        if(err == ESP_NOW_SEND_SUCCESS) {
+        if(err == ESP_OK) {
             break;
         }
     }
 
-    if(err != ESP_NOW_SEND_FAIL) {
+    if(err != ESP_OK) {
         /* Need to retrieve channel for broadcast. */
         esp_now_peer_info_t master_info;
         esp_now_get_peer(master_mac_addr, &master_info);
