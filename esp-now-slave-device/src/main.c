@@ -28,7 +28,7 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 
 /* Sleeping times. */
 #define TEST_INITIAL_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
-#define TEST_PIR_START_UP_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
+#define TEST_PIR_START_UP_SLEEP_TIME 60000000 /* 60000000 == 60 seconds. */
 #define TEST_FIRST_MOTION_DETECTED_SLEEP_TIME 5000000 /* 5000000 == 5 seconds. */
 #define TEST_IR_BEAM_PULSE_INTERVAL 5000000 /* 5000000 == 5 seconds. */
 
@@ -37,12 +37,13 @@ Purpose: This source code is meant to be uploaded to Master ESP32 device.
 #define IR_SENSOR_READ_PIN 25
 #define IR_SENSOR_TRANSISTOR_PIN 26
 #define IR_EMITTER_TRANSISTOR_PIN 27
+#define IR_SENSOR_READ_DELAY 5 /* 1s. */
 
 /* PIR pins. */
 #define PIR_TRANSISTOR_PIN 32
 #define PIR_READ_PIN 33
 
-#define MAX_PULSE_COUNT 10
+#define MAX_PULSE_COUNT 3
 
 
 typedef enum device_state {
@@ -148,16 +149,19 @@ void setupComponents(const uint8_t *master_mac_addr, const uint8_t wifi_channel)
 /********** Pin configurations start. **********/
 void irPinConfig() { 
     printf("irPinConfig() call entry...\n");
-    
-   const gpio_config_t cfg = {
-    .pin_bit_mask = (1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN | 1ULL << IR_EMITTER_TRANSISTOR_PIN),
-    .mode = GPIO_MODE_OUTPUT, /* Make sure to change IR_SENSOR_READ_PIN to input. */
-    .intr_type = GPIO_INTR_DISABLE
-   };
-   gpio_config(&cfg);
+        
+    const gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN | 1ULL << IR_EMITTER_TRANSISTOR_PIN),
+        .mode = GPIO_MODE_OUTPUT, /* Make sure to change IR_SENSOR_READ_PIN to input. */
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&cfg);
 
-   gpio_set_direction(IR_SENSOR_READ_PIN, GPIO_MODE_INPUT); 
-   gpio_pullup_en(IR_SENSOR_READ_PIN);
+    gpio_set_level(IR_SENSOR_TRANSISTOR_PIN, HIGH);
+    gpio_set_level(IR_EMITTER_TRANSISTOR_PIN, HIGH);
+
+    gpio_set_direction(IR_SENSOR_READ_PIN, GPIO_MODE_INPUT); 
+    gpio_pullup_en(IR_SENSOR_READ_PIN);
     printf("irPinConfig() call exit...\n");
 } /* End of pinConfig(). */
 
@@ -181,8 +185,8 @@ void rtc_PirReadPinConfig() {
 void rtc_PirTurnOff() {
     printf("rtc_PirTurnOff() call entry...\n");
     rtc_gpio_hold_dis(PIR_TRANSISTOR_PIN);
-    rtc_gpio_set_direction(RTC_GPIO_MODE_DISABLED, PIR_TRANSISTOR_PIN);
-    rtc_gpio_set_direction(RTC_GPIO_MODE_DISABLED, PIR_READ_PIN);
+    rtc_gpio_set_direction(PIR_TRANSISTOR_PIN, RTC_GPIO_MODE_DISABLED);
+    rtc_gpio_set_direction(PIR_READ_PIN, RTC_GPIO_MODE_DISABLED);
     rtc_gpio_deinit(PIR_TRANSISTOR_PIN);
     rtc_gpio_deinit(PIR_READ_PIN);
     printf("rtc_PirTurnOff() call exit...\n");
@@ -199,11 +203,39 @@ void turnOffIrPin(uint64_t mask) {
     gpio_config(&cfg);
     printf("turnOffIrPin() call exit...\n");
 }/* End of turnOffIrPin(). */
+
+/********** readIrPin() wrapper functions start. **********/
+uint8_t readIrPin() {
+    uint8_t sensor_read_level;
+
+    /* Configure IR pins to be used. */
+    printf("\nCalling irPinConfig().\n");
+    irPinConfig();
+
+    printf("\nReading sensor level...\n");
+    sensor_read_level = gpio_get_level(IR_SENSOR_READ_PIN); /* Read sensor state. */
+    printf("Delaying ~5ms to allow IR sensor to process signal...\n");
+   
+    vTaskDelay(IR_SENSOR_READ_DELAY);
+    printf("Sensor read level: %d.\n", sensor_read_level);    
+    /* For debug. */
+    printf("Deactivating IR pins...\n"); 
+
+    turnOffIrPin(1ULL << IR_EMITTER_TRANSISTOR_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN);
+
+    // printf("IR pin turned OFF. Signal should be LOW...\n");
+    // printf("Delaying... Check Signal if LOW...\n");
+    // vTaskDelay(IR_SENSOR_READ_DELAY);
+
+    return sensor_read_level;
+}
+/********** readIrPin() wrapper functions end. **********/
 /********** Pin configurations End. **********/
 
 
 /********** Sleep configurations start. **********/
 void configDeepSleep(sleep_mode_t mode) {
+    bool rtc_pd_shutdown = true;
     printf("configDeepSleep() call entry...\n");
 
     /* Turn ON then OFF all Power Domains (PDs). Based on my current knowledge of 
@@ -218,6 +250,7 @@ void configDeepSleep(sleep_mode_t mode) {
         esp_sleep_enable_timer_wakeup(TEST_PIR_START_UP_SLEEP_TIME);
     }
     else if(mode == SLEEP_AWAIT_MOTION) {
+        rtc_pd_shutdown = false;
         esp_sleep_enable_ext0_wakeup(PIR_READ_PIN, HIGH); /* This one is signal driven. The rest are timer-based wakeup source.*/
     }
     else if(mode == SLEEP_RETRIEVAL_TIME) {
@@ -226,6 +259,18 @@ void configDeepSleep(sleep_mode_t mode) {
     else { /* mode == SLEEP_IR_BEAM_PULSE_TIME. */
         esp_sleep_enable_timer_wakeup(TEST_IR_BEAM_PULSE_INTERVAL);
     }
+
+    // if(rtc_pd_shutdown) {
+    //     for(int i = 0; i < ESP_PD_DOMAIN_MAX; ++i) {
+    //         esp_sleep_pd_config(i, ESP_PD_OPTION_ON);
+    //     }
+
+
+    //     for(int i = 0; i < ESP_PD_DOMAIN_MAX; ++i) {
+    //         esp_sleep_pd_config(i, ESP_PD_OPTION_OFF);
+    //     }
+    // }
+
     printf("configDeepSleep() call exit...\n");
 
 } /* End of configDeepSleep(). */
@@ -273,7 +318,7 @@ void broadcastPanic(uint8_t wifi_channel) {
 
     esp_message msg = {
         .flag = ERROR_BROADCAST,
-        .sensor_read_level = 0,
+        .sensor_read_level = 255,
         .message = "Error Broadcasted! Unicast failed. Check system configuration."
     };
 
@@ -285,18 +330,19 @@ void broadcastPanic(uint8_t wifi_channel) {
 esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
     esp_err_t err;
     int try_cap = 4; /* 1 for the first send. 3 for the resend. */
+    size_t message_size = sizeof(msg.flag) + sizeof(msg.sensor_read_level) + strlen(msg.message) + 1; /* +1 for the NULL char. */
 
     for(int i = 0; i < try_cap; ++i) {
     /* For debug. */
         printf("Retry #%d...\n", i);
-        err = esp_now_send(master_mac_addr, (const uint8_t *)&msg, sizeof(msg));
+        err = esp_now_send(master_mac_addr, (const uint8_t *)&msg, message_size);
 
-        if(err == ESP_OK) {
+        if(err == ESP_NOW_SEND_SUCCESS) {
             break;
         }
     }
 
-    if(err != ESP_OK) {
+    if(err != ESP_NOW_SEND_FAIL) {
         /* Need to retrieve channel for broadcast. */
         esp_now_peer_info_t master_info;
         esp_now_get_peer(master_mac_addr, &master_info);
@@ -308,29 +354,6 @@ esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
 
 
 /********** ESP_NOW_SEND wrapper functions end. **********/
-
-
-
-/********** readIrPin() wrapper functions start. **********/
-uint8_t readIrPin() {
-    uint8_t sensor_read_level;
-
-    /* Configure IR pins to be used. */
-    printf("\nCalling irPinConfig().\n");
-    irPinConfig();
-
-    printf("\nReading sensor level...\n");
-    sensor_read_level = gpio_get_level(IR_SENSOR_READ_PIN); /* Read sensor state. */
-        
-    /* For debug. */
-    printf("Deactivating IR pins...\n");
-    turnOffIrPin(1ULL << IR_EMITTER_TRANSISTOR_PIN | 1ULL << IR_SENSOR_READ_PIN | 1ULL << IR_SENSOR_TRANSISTOR_PIN);
-
-    return sensor_read_level;
-}
-/********** readIrPin() wrapper functions end. **********/
-
-
 
 
 /********** APP_MAIN start. **********/
@@ -417,6 +440,7 @@ void app_main() {
         }  /* case FROM_INITIAL_READ: */
 
         case PIR_READY: { /* After PIR startup. */
+            printf("PIR Sensor Ready...\n");
             printf("Activating rtc PIR read pins...\n");
             rtc_PirReadPinConfig();
             next_sleep_mode = SLEEP_AWAIT_MOTION;
@@ -432,6 +456,8 @@ void app_main() {
             break;
         } /* case AWAITING_FOR_MOTION: */
         case IR_BEAM_PULSE: {            
+
+            printf("IR Beam Pulse Phase...\n");
             next_sleep_mode = SLEEP_INITIAL_TIME; /* Assuming it's Done. Reset state.*/
 
             if(pulse_counter < MAX_PULSE_COUNT) {
@@ -464,9 +490,17 @@ void app_main() {
                     
                     try_send(master_mac_addr, msg);
                     next_phase.state = INITIAL_READ;
+                    
                 } /* for if(sensor_read_level == HIGH). */
-                else {
+                else { /* sensor_read_level == LOW */
                     next_sleep_mode = SLEEP_IR_BEAM_PULSE_TIME;
+                    ++pulse_counter;
+                    printf("IR Pulse Count: %d.\n", pulse_counter);
+                    if(pulse_counter == MAX_PULSE_COUNT) {
+                        printf("Max Pulse Count Reached! Returning to initial state.\n");
+                        next_phase.state = INITIAL_READ;
+                        pulse_counter = 0;
+                    }
                 }
             } /* for if(pulse_counter < MAX_PULSE_COUNT).*/
             break;
