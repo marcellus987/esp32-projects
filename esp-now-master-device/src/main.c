@@ -85,26 +85,34 @@ void onSent(const esp_now_send_info_t *peer_info, esp_now_send_status_t status) 
 }
 
 void onReceived(const esp_now_recv_info_t *peer_info, const uint8_t *data_received, int data_len) {
-    bool sensor_status = data_received[0];
+    esp_message *msg = (esp_message *)data_received;
 
     printf("\nReceived from:\n");
     printf("Sender MAC address: " MACSTR "\n", MAC2STR(peer_info->src_addr));
-    
-    
-    // This is sizeof(data_received) - 1 because null char is not included.
-    printf("Message length: %d\n", strlen((const char*)data_received+1));  
+    printf("Message flag: %s\n", msg->flag == NORMAL_MESSAGE ? "Normal" : msg->flag == SENSOR_READ ? "Sensor Read" : "ERROR_BROADCAST");
+    printf("Message length: %d\n", data_len);  
     printf("Message: \n");
-    printf("Beam status: %s.\n", sensor_status == HIGH ? "Unbroken" : "Broken");
-    printf("Rest of the message: %s.\n\n", data_received + 1); // Skip the first byte which contains non-message info.
-
-    if(sensor_status == HIGH) { /* Beam is not broken. No mail in the mailbox!. */
-        gpio_set_level(RED_LED_PIN, LOW);
+    
+    if(msg->flag == SENSOR_READ) {
+        bool sensor_status = msg->sensor_read_level;
+        printf("Beam status: %s.\n", sensor_status == HIGH ? "Unbroken" : "Broken");
+        if(sensor_status == HIGH) { /* Beam is not broken. No mail in the mailbox!. */
+            gpio_set_level(RED_LED_PIN, LOW);
+            gpio_set_level(GREEN_LED_PIN, HIGH);
+        }
+        else { /* Beam broken. There is mail in the mailbox. */
+            gpio_set_level(RED_LED_PIN, HIGH);
+            gpio_set_level(GREEN_LED_PIN, LOW);
+        }
+    }
+    else if(msg->flag == ERROR_BROADCAST) {
+        gpio_set_level(RED_LED_PIN, HIGH);
         gpio_set_level(GREEN_LED_PIN, HIGH);
     }
-    else { /* Beam broken. There is mail in the mailbox. */
-        gpio_set_level(RED_LED_PIN, HIGH);
-        gpio_set_level(GREEN_LED_PIN, LOW);
-    }
+  
+    printf("Rest of the message: %s.\n\n", msg->message); // Skip the first byte which contains non-message info.
+
+    
 } // End of onReceived().
 
 /* MISC Functions. */
@@ -137,14 +145,17 @@ void app_main() {
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
     /* Construct first message. */
-    char data[100];
-    sprintf(data, "Message #%d: Hello from master.", ++message_count);
+    esp_message msg;
 
-    esp_now_send(slave_mac, (const uint8_t*) data, sizeof(data));
+    msg.flag = NORMAL_MESSAGE;
+    msg.sensor_read_level = 255;
+
+    snprintf(msg.message, sizeof(msg.message), "Message #%d: Hello from master.", ++message_count);
+
+    esp_now_send(slave_mac, (const uint8_t*)&msg, sizeof(msg));
 
 
 /* Loop. */
-
 
     // while (true) {
        
