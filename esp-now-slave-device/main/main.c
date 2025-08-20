@@ -364,7 +364,7 @@ esp_err_t try_send(const uint8_t *master_mac_addr, const esp_message msg) {
     This way, the program can avoid unnecessary component setup when pin is HIGH, since it will not send anything.
 */
 
-void app_main() {
+void app_main(void) {
     printf("app_main() start...\n");
     device_state_t current_state;
     sleep_mode_t next_sleep_mode = SLEEP_INITIAL_TIME;
